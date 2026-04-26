@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { feature } from 'topojson-client';
 import worldData from 'world-atlas/countries-110m.json';
 import type { Topology, GeometryCollection } from 'topojson-specification';
-import type { Country, Province, Army } from '../lib/types';
+import type { Country, Province, Army, TradeRoute, RoutePath } from '../lib/types';
+import { supabase } from '../lib/supabase';
 
 interface WorldMapProps {
   countries: Country[];
@@ -70,12 +71,6 @@ function getProvinceRadius(type: Province['type']): number {
   return 2.5;
 }
 
-function getLabelFontSize(type: Province['type'], zoom: number): number {
-  const base = type === 'capital' ? 2 : type === 'core' ? 1 : .7;
-  return base * Math.min(zoom, 2);
-}
-
-// Compute signed area of a polygon ring (lng/lat coords)
 function ringArea(ring: number[][]): number {
   let area = 0;
   for (let i = 0; i < ring.length - 1; i++) {
@@ -84,7 +79,6 @@ function ringArea(ring: number[][]): number {
   return area / 2;
 }
 
-// Centroid of a polygon (first ring) in lng/lat
 function polygonCentroid(coordinates: number[][][]): [number, number] | null {
   const ring = coordinates[0];
   if (!ring || ring.length < 3) return null;
@@ -102,7 +96,6 @@ function polygonCentroid(coordinates: number[][][]): [number, number] | null {
   return [cx / (6 * area), cy / (6 * area)];
 }
 
-// Get centroid of largest polygon in a feature
 function featureCentroid(f: GeoJSON.Feature): [number, number] | null {
   const geom = f.geometry;
   if (!geom) return null;
@@ -132,6 +125,8 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
   const [vbY, setVbY] = useState(0);
   const [tooltip, setTooltip] = useState<{ province: Province; x: number; y: number } | null>(null);
   const [hoveredCountry, setHoveredCountry] = useState<string | null>(null);
+  const [tradeRoutes, setTradeRoutes] = useState<(TradeRoute & { paths: RoutePath[] })[]>([]);
+  const [showRoutes, setShowRoutes] = useState(true);
 
   const countryById = useMemo(
     () => Object.fromEntries(countries.map((c) => [c.id, c])),
@@ -148,7 +143,6 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
     return map;
   }, [countries]);
 
-  // Armies grouped by province
   const armiesByProvince = useMemo(() => {
     const map: Record<string, Army[]> = {};
     for (const army of armies) {
@@ -177,7 +171,6 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
     return map;
   }, [geoFeatures, countryByName]);
 
-  // Precompute centroids for country name labels
   const featureCentroids = useMemo(() => {
     const map = new Map<number, [number, number]>();
     for (const f of geoFeatures) {
@@ -187,6 +180,21 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
     return map;
   }, [geoFeatures]);
 
+  // Load trade routes
+  useEffect(() => {
+    (async () => {
+      const { data: routes } = await supabase.from('trade_routes').select('*');
+      if (!routes) return;
+
+      const withPaths = await Promise.all((routes as TradeRoute[]).map(async (route) => {
+        const { data: paths } = await supabase.from('route_paths').select('*').eq('trade_route_id', route.id);
+        return { ...route, paths: (paths ?? []) as RoutePath[] };
+      }));
+
+      setTradeRoutes(withPaths);
+    })();
+  }, []);
+
   const vbW = MAP_WIDTH / zoom;
   const vbH = MAP_HEIGHT / zoom;
 
@@ -195,12 +203,9 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
   }, [vbX, vbY, vbW, vbH]);
 
   const onWheel = useCallback((e: React.WheelEvent) => {
-    const target = e.target as SVGElement;
-    if (target.closest('svg')) {
-      e.preventDefault();
-      const delta = e.deltaY > 0 ? 0.9 : 1.1;
-      setZoom((z) => Math.min(8, Math.max(1, z * delta)));
-    }
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    setZoom((z) => Math.min(8, Math.max(1, z * delta)));
   }, []);
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
@@ -234,9 +239,16 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
     if (!geom) return '';
     if (geom.type === 'Polygon') return polygonToPath(geom.coordinates as number[][][]);
     if (geom.type === 'MultiPolygon') {
-      return (geom.coordinates as number[][][][]).map((poly) => polygonToPath(poly)).join('');
+      return (geom.coordinates as number[][][][]).map(poly => polygonToPath(poly)).join('');
     }
     return '';
+  }
+
+  function routePathToSvgPath(coords: [number, number][]): string {
+    return coords.map(([lng, lat], i) => {
+      const [x, y] = latLngToXY(lat, lng);
+      return `${i === 0 ? 'M' : 'L'}${x},${y}`;
+    }).join(' ');
   }
 
   return (
@@ -261,17 +273,13 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
-          <filter id="armyGlow" x="-100%" y="-100%" width="300%" height="300%">
-            <feGaussianBlur stdDeviation="2.5" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
+          <pattern id="dots" x="4" y="4" width="8" height="8" patternUnits="userSpaceOnUse">
+            <circle cx="2" cy="2" r="0.5" fill="currentColor" opacity="0.4" />
+          </pattern>
         </defs>
 
-        {/* Grid lines */}
-        <g opacity={0.05} stroke="#64748b" strokeWidth={0.5}>
+        {/* Grid */}
+        <g opacity={0.06} stroke="#64748b" strokeWidth={0.5}>
           {[-60, -30, 0, 30, 60].map((lat) => {
             const [, y] = latLngToXY(lat, 0);
             return <line key={lat} x1={0} y1={y} x2={MAP_WIDTH} y2={y} />;
@@ -282,106 +290,125 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
           })}
         </g>
 
-        {/* ── Country fill layer ── */}
+        {/* Trade routes (under boundaries) */}
+        {showRoutes && (
+          <g>
+            {tradeRoutes.flatMap((route) =>
+              route.paths.map((path) => {
+                const svgPath = routePathToSvgPath(path.coordinates as [number, number][]);
+                const strokeDash = path.route_type === 'road' ? '4,2' : 'none';
+                const strokeColor = path.route_type === 'air' ? '#60a5fa' : '#f97316';
+
+                return (
+                  <path
+                    key={`${route.id}-${path.id}`}
+                    d={svgPath}
+                    stroke={strokeColor}
+                    strokeWidth={path.route_type === 'air' ? 1 : 1.5}
+                    fill="none"
+                    strokeDasharray={strokeDash}
+                    opacity={0.4}
+                  />
+                );
+              })
+            )}
+          </g>
+        )}
+
+        {/* Country boundaries (thick solid lines) */}
         <g>
           {geoFeatures.map((f) => {
             const country = featureCountryMap.get(f.id as number);
-            const isGameCountry = !!country;
+            const isGameCountry = country !== null && country !== undefined;
             const isHovered = hoveredCountry === country?.id;
             const path = featureToPath(f);
+
             if (!path) return null;
 
-            const fillColor = isGameCountry ? country.flag_color : '#1a2535';
-            const fillOpacity = isGameCountry ? (isHovered ? 0.48 : 0.28) : 0.18;
+            const fillColor = isGameCountry
+              ? (country as Country).flag_color
+              : '#1e293b';
+            const fillOpacity = isGameCountry
+              ? (isHovered ? 0.55 : 0.35)
+              : 0.3;
+            const strokeColor = isGameCountry
+              ? (country as Country).flag_color
+              : '#334155';
+            const strokeWidth = isGameCountry
+              ? (isHovered ? 1.8 : 1.2)
+              : 0.5;
 
             return (
               <path
-                key={`fill-${f.id as number}`}
+                key={f.id as number}
                 d={path}
                 fill={fillColor}
                 fillOpacity={fillOpacity}
-                stroke="none"
-                onMouseEnter={() => isGameCountry && setHoveredCountry(country.id)}
+                stroke={strokeColor}
+                strokeWidth={strokeWidth}
+                strokeLinejoin="round"
+                onMouseEnter={() => {
+                  if (isGameCountry) setHoveredCountry((country as Country).id);
+                }}
                 onMouseLeave={() => setHoveredCountry(null)}
                 className={isGameCountry ? 'cursor-pointer' : ''}
-                style={{ transition: 'fill-opacity 0.2s' }}
+                style={{ transition: 'fill-opacity 0.15s, stroke-width 0.15s' }}
               />
             );
           })}
         </g>
 
-        {/* ── Country boundary lines ── */}
-        {/* Non-game countries: dotted gray */}
-        <g>
-          {geoFeatures.map((f) => {
-            const country = featureCountryMap.get(f.id as number);
-            if (country) return null;
-            const path = featureToPath(f);
-            if (!path) return null;
-            return (
-              <path
-                key={`border-other-${f.id as number}`}
-                d={path}
-                fill="none"
-                stroke="rgba(100,116,139,0.3)"
-                strokeWidth={0.20}
-                strokeDasharray="2,3"
-                strokeLinejoin="round"
-                pointerEvents="none"
-              />
+        {/* Province boundaries (dotted lines) */}
+        <g opacity={0.3}>
+          {provinces.map((province) => {
+            const capital = provinces.find(
+              (p) => p.country_id === province.country_id && p.type === 'capital'
             );
-          })}
-        </g>
-        {/* Game countries: solid white line */}
-        <g>
-          {geoFeatures.map((f) => {
-            const country = featureCountryMap.get(f.id as number);
-            if (!country) return null;
-            const isHovered = hoveredCountry === country.id;
-            const path = featureToPath(f);
-            if (!path) return null;
+            if (!capital) return null;
+
+            const [x1, y1] = latLngToXY(province.lat, province.lng);
+            const [x2, y2] = latLngToXY(capital.lat, capital.lng);
+
+            if (province.id === capital.id) return null;
+
             return (
-              <path
-                key={`border-game-${f.id as number}`}
-                d={path}
-                fill="none"
-                stroke={isHovered ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.65)'}
-                strokeWidth={isHovered ? .8 : 0.5}
-                strokeLinejoin="round"
-                style={{ transition: 'stroke-width 0.15s, stroke 0.15s' }}
-                pointerEvents="none"
+              <line
+                key={`boundary-${province.id}`}
+                x1={x1}
+                y1={y1}
+                x2={x2}
+                y2={y2}
+                stroke="#94a3b8"
+                strokeWidth={0.3}
+                strokeDasharray="2,2"
+                opacity={0.4}
               />
             );
           })}
         </g>
 
-        {/* ── Country name labels at polygon centroid ── */}
+        {/* Country name labels */}
         <g>
-          {geoFeatures.map((f) => {
-            const country = featureCountryMap.get(f.id as number);
-            if (!country) return null;
-            const centroid = featureCentroids.get(f.id as number);
-            if (!centroid) return null;
-            const [lng, lat] = centroid;
-            const [x, y] = latLngToXY(lat, lng);
-            const isPlayable = country.type === 'playable';
-            const fontSize = zoom > 3 ? 8 : zoom > 2 ? 6 : zoom > 1.5 ? 5 : 4;
+          {countries.map((country) => {
+            const cProvs = provinces.filter((p) => p.country_id === country.id);
+            if (cProvs.length === 0) return null;
+            const avgLat = cProvs.reduce((s, p) => s + p.lat, 0) / cProvs.length;
+            const avgLng = cProvs.reduce((s, p) => s + p.lng, 0) / cProvs.length;
+            const [x, y] = latLngToXY(avgLat, avgLng);
 
             return (
               <text
-                key={`name-${f.id as number}`}
+                key={`label-${country.id}`}
                 x={x}
                 y={y}
                 textAnchor="middle"
                 dominantBaseline="middle"
-                fill={isPlayable ? 'rgba(255,255,255,0.92)' : 'rgba(148,163,184,0.6)'}
-                fontSize={fontSize}
-                fontWeight={isPlayable ? '700' : '500'}
+                fill="white"
+                fillOpacity={0.7}
+                fontSize={zoom > 2 ? 6 : zoom > 1.5 ? 5 : 4}
+                fontWeight="600"
                 fontFamily="system-ui, sans-serif"
-                stroke="rgba(0,0,0,0.75)"
-                strokeWidth={isPlayable ? 3 : 2.5}
-                paintOrder="stroke"
-                style={{ pointerEvents: 'none', letterSpacing: '0.04em' }}
+                style={{ pointerEvents: 'none' }}
               >
                 {country.name}
               </text>
@@ -389,7 +416,7 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
           })}
         </g>
 
-        {/* ── Province connection lines (dotted, from capital) ── */}
+        {/* Capital connection lines */}
         <g>
           {countries.map((country) => {
             const cProvinces = provinces.filter((p) => p.country_id === country.id);
@@ -408,9 +435,8 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
                         x1={cx} y1={cy}
                         x2={px} y2={py}
                         stroke={country.flag_color}
-                        strokeWidth={0.4}
-                        opacity={0.8}
-                        strokeDasharray="1.5,3"
+                        strokeWidth={0.3}
+                        opacity={0.15}
                       />
                     );
                   })}
@@ -419,16 +445,14 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
           })}
         </g>
 
-        {/* ── Province markers ── */}
+        {/* Province dots */}
         <g>
           {provinces.map((province) => {
             const [x, y] = latLngToXY(province.lat, province.lng);
             const country = countryById[province.country_id];
             const isSelected = selectedProvince?.id === province.id;
             const r = getProvinceRadius(province.type);
-            const color = isSelected ? '#f59e0b' : (country?.flag_color ?? '#4b5563');
-            const labelSize = getLabelFontSize(province.type, zoom);
-            const isCapital = province.type === 'capital';
+            const armyCount = armiesByProvince[province.id]?.length ?? 0;
 
             return (
               <g
@@ -438,109 +462,27 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
                 onMouseLeave={() => setTooltip(null)}
                 className="cursor-pointer"
               >
-                {/* Selection pulse */}
                 {isSelected && (
-                  <circle cx={x} cy={y} r={r + 5} fill="none" stroke="#f59e0b" strokeWidth={1.5} opacity={0.6} filter="url(#glow)">
-                    <animate attributeName="r" values={`${r + 4};${r + 8};${r + 4}`} dur="1.5s" repeatCount="indefinite" />
+                  <circle cx={x} cy={y} r={r + 4} fill="none" stroke="#f59e0b" strokeWidth={1.5} opacity={0.7} filter="url(#glow)">
+                    <animate attributeName="r" values={`${r + 3};${r + 6};${r + 3}`} dur="1.5s" repeatCount="indefinite" />
                   </circle>
                 )}
-
-                {isCapital ? (
-                  <>
-                    <circle cx={x} cy={y} r={r} fill="none" stroke={color} strokeWidth={isSelected ? 1 : .5} />
-                    
-                    <line x1={x - r - 2} y1={y} x2={x - r + 1} y2={y} stroke={color} strokeWidth={1} opacity={0.8} />
-                    <line x1={x + r - 1} y1={y} x2={x + r + 2} y2={y} stroke={color} strokeWidth={1} opacity={0.8} />
-                    <line x1={x} y1={y - r - 2} x2={x} y2={y - r + 1} stroke={color} strokeWidth={1} opacity={0.8} />
-                    <line x1={x} y1={y + r - 1} x2={x} y2={y + r + 2} stroke={color} strokeWidth={1} opacity={0.8} />
-                  </>
-                ) : (
-                  <>
-                    
-                    <circle cx={x} cy={y} r={isSelected ? 1 : .8} fill={color} />
-                  </>
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={r}
+                  fill={isSelected ? '#f59e0b' : country?.flag_color ?? '#4b5563'}
+                  stroke={isSelected ? '#f59e0b' : 'rgba(255,255,255,0.3)'}
+                  strokeWidth={isSelected ? 1.5 : 0.5}
+                />
+                {province.type === 'capital' && (
+                  <circle cx={x} cy={y} r={r * 0.35} fill="rgba(255,255,255,0.7)" />
                 )}
-
-                {/* Province name */}
-                <text
-                  x={x}
-                  y={y + r + labelSize + 1}
-                  textAnchor="middle"
-                  dominantBaseline="hanging"
-                  fill={isSelected ? '#f59e0b' : (isCapital ? 'white' : 'rgba(255,255,255,0.75)')}
-                  fontSize={labelSize}
-                  fontWeight={isCapital ? '700' : '500'}
-                  fontFamily="system-ui, sans-serif"
-                  stroke="rgba(0,0,0,0.65)"
-                  strokeWidth={isCapital ? 3 : 2}
-                  paintOrder="stroke"
-                  style={{ pointerEvents: 'none' }}
-                >
-                  {province.name}
-                </text>
-              </g>
-            );
-          })}
-        </g>
-
-        {/* ── Army markers ── */}
-        <g>
-          {provinces.map((province) => {
-            const provinceArmies = armiesByProvince[province.id];
-            if (!provinceArmies || provinceArmies.length === 0) return null;
-
-            const totalUnits = provinceArmies.reduce((s, a) => s + a.unit_count, 0);
-            const [x, y] = latLngToXY(province.lat, province.lng);
-            const pr = getProvinceRadius(province.type);
-
-            // Army badge offset above province dot
-            const ax = x + 7;
-            const ay = y - pr - 6;
-
-            const dominantStatus = provinceArmies.find((a) => a.status === 'attacking')?.status
-              ?? provinceArmies.find((a) => a.status === 'moving')?.status
-              ?? 'idle';
-
-            const armyColor = dominantStatus === 'attacking'
-              ? '#ef4444'
-              : dominantStatus === 'moving'
-              ? '#f59e0b'
-              : '#22c55e';
-
-            return (
-              <g key={`army-${province.id}`} style={{ pointerEvents: 'none' }}>
-                {/* Pulse glow for attacking */}
-                {dominantStatus === 'attacking' && (
-                  <circle cx={ax} cy={ay} r={7} fill="none" stroke="#ef4444" strokeWidth={1} opacity={0}>
-                    <animate attributeName="r" values="5;10;5" dur="0.9s" repeatCount="indefinite" />
-                    <animate attributeName="opacity" values="0.7;0;0.7" dur="0.9s" repeatCount="indefinite" />
-                  </circle>
+                {armyCount > 0 && (
+                  <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize={armyCount > 5 ? 2.5 : 2} fill="#fff" fontWeight="bold">
+                    {armyCount}
+                  </text>
                 )}
-                {/* Glow bg */}
-                <circle cx={ax} cy={ay} r={5.5} fill={armyColor} fillOpacity={0.15} filter="url(#armyGlow)" />
-                {/* Badge */}
-                <circle cx={ax} cy={ay} r={5} fill="#0d1b2a" stroke={armyColor} strokeWidth={1.3} />
-                {/* Cross/sword icon */}
-                <line x1={ax - 2.8} y1={ay} x2={ax + 2.8} y2={ay} stroke={armyColor} strokeWidth={1.1} />
-                <line x1={ax} y1={ay - 2.8} x2={ax} y2={ay + 2.8} stroke={armyColor} strokeWidth={1.1} />
-                {/* Guard crossbar */}
-                <line x1={ax - 1.8} y1={ay - 1} x2={ax + 1.8} y2={ay - 1} stroke={armyColor} strokeWidth={0.8} opacity={0.75} />
-                {/* Unit count */}
-                <text
-                  x={ax}
-                  y={ay + 8}
-                  textAnchor="middle"
-                  dominantBaseline="hanging"
-                  fill={armyColor}
-                  fontSize={zoom > 2 ? 4 : 3.5}
-                  fontWeight="700"
-                  fontFamily="system-ui, sans-serif"
-                  stroke="rgba(0,0,0,0.85)"
-                  strokeWidth={2.5}
-                  paintOrder="stroke"
-                >
-                  {totalUnits >= 1000 ? `${(totalUnits / 1000).toFixed(1)}k` : String(totalUnits)}
-                </text>
               </g>
             );
           })}
@@ -552,13 +494,12 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
         <ProvinceTooltip
           province={tooltip.province}
           country={countryById[tooltip.province.country_id]}
-          armies={armiesByProvince[tooltip.province.id] ?? []}
           x={tooltip.x}
           y={tooltip.y}
         />
       )}
 
-      {/* Zoom controls */}
+      {/* Controls */}
       <div className="absolute bottom-4 right-4 flex flex-col gap-1">
         <button
           onClick={() => setZoom((z) => Math.min(8, z * 1.3))}
@@ -567,54 +508,35 @@ export function WorldMap({ countries, provinces, armies, onSelectProvince, selec
         <button
           onClick={() => setZoom((z) => Math.max(1, z / 1.3))}
           className="w-8 h-8 bg-gray-800/90 hover:bg-gray-700 text-white rounded text-lg flex items-center justify-center transition-colors border border-gray-700"
-        >-</button>
+        >−</button>
         <button
           onClick={() => { setZoom(1); setVbX(0); setVbY(0); }}
-          className="w-8 h-8 bg-gray-800/90 hover:bg-gray-700 text-white rounded text-xs flex items-center justify-center transition-colors border border-gray-700 text-[10px]"
-        >RST</button>
+          className="w-8 h-8 bg-gray-800/90 hover:bg-gray-700 text-white rounded text-xs flex items-center justify-center transition-colors border border-gray-700"
+        >↺</button>
+        <button
+          onClick={() => setShowRoutes(!showRoutes)}
+          className={`w-8 h-8 rounded text-xs flex items-center justify-center transition-colors border ${showRoutes ? 'bg-blue-600 border-blue-500' : 'bg-gray-800/90 border-gray-700'} text-white hover:bg-blue-700`}
+          title="Toggle trade routes"
+        >⊙</button>
       </div>
 
       {/* Legend */}
-      <div className="absolute bottom-4 left-4 bg-gray-900/95 border border-gray-700 rounded-xl p-3 text-xs text-gray-300 space-y-1.5 backdrop-blur-sm">
+      <div className="absolute bottom-4 left-4 bg-gray-900/90 border border-gray-700 rounded-lg p-3 text-xs text-gray-300 space-y-1.5 backdrop-blur-sm">
         <div className="text-gray-400 font-semibold mb-2 uppercase tracking-wider text-[10px]">Legend</div>
-        <div className="flex items-center gap-2">
-          <svg width={16} height={16}>
-            <circle cx={8} cy={8} r={6} fill="none" stroke="#f59e0b" strokeWidth={1.5} />
-            <circle cx={8} cy={8} r={2.8} fill="#f59e0b" />
-          </svg>
-          <span>Capital</span>
-        </div>
-        <LegendItem color="#6b7280" size={3.5} label="Core Province" />
+        <LegendItem color="#f59e0b" size={6} label="Capital" />
+        <LegendItem color="#6b7280" size={3.5} label="Core" />
         <LegendItem color="#374151" size={2.5} label="Peripheral" />
-        <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
+        <div className="border-t border-gray-700 pt-2 mt-2 space-y-1">
           <div className="flex items-center gap-2">
-            <svg width={16} height={3}><line x1={0} y1={1.5} x2={16} y2={1.5} stroke="rgba(255,255,255,0.65)" strokeWidth={1} /></svg>
-            <span>Nation Border</span>
+            <div className="w-4 h-0.5 border-b-2 border-blue-400" />
+            <span className="text-[10px]">Air Route</span>
           </div>
           <div className="flex items-center gap-2">
-            <svg width={16} height={3}><line x1={0} y1={1.5} x2={16} y2={1.5} stroke="rgba(100,116,139,0.4)" strokeWidth={1} strokeDasharray="2,2" /></svg>
-            <span>Non-playable</span>
+            <div className="w-4 h-0.5 border-b-2 border-orange-400" style={{ borderDasharray: '2,2' }} />
+            <span className="text-[10px]">Road Route</span>
           </div>
-        </div>
-        <div className="border-t border-gray-700 pt-2 mt-1 space-y-1.5">
-          <ArmyLegendRow color="#22c55e" label="Idle Army" />
-          <ArmyLegendRow color="#f59e0b" label="Moving" />
-          <ArmyLegendRow color="#ef4444" label="Attacking" />
         </div>
       </div>
-    </div>
-  );
-}
-
-function ArmyLegendRow({ color, label }: { color: string; label: string }) {
-  return (
-    <div className="flex items-center gap-2">
-      <svg width={14} height={14}>
-        <circle cx={7} cy={7} r={5} fill="#0d1b2a" stroke={color} strokeWidth={1.2} />
-        <line x1={4} y1={7} x2={10} y2={7} stroke={color} strokeWidth={1} />
-        <line x1={7} y1={4} x2={7} y2={10} stroke={color} strokeWidth={1} />
-      </svg>
-      <span>{label}</span>
     </div>
   );
 }
@@ -623,8 +545,7 @@ function LegendItem({ color, size, label }: { color: string; size: number; label
   return (
     <div className="flex items-center gap-2">
       <svg width={16} height={16}>
-        <circle cx={8} cy={8} r={size} fill="none" stroke={color} strokeWidth={0.8} opacity={0.7} />
-        <circle cx={8} cy={8} r={1.5} fill={color} />
+        <circle cx={8} cy={8} r={size} fill={color} />
       </svg>
       <span>{label}</span>
     </div>
@@ -634,13 +555,11 @@ function LegendItem({ color, size, label }: { color: string; size: number; label
 function ProvinceTooltip({
   province,
   country,
-  armies,
   x,
   y,
 }: {
   province: Province;
   country: Country | undefined;
-  armies: Army[];
   x: number;
   y: number;
 }) {
@@ -651,28 +570,24 @@ function ProvinceTooltip({
     money: 'text-amber-400',
   };
 
-  const totalUnits = armies.reduce((s, a) => s + a.unit_count, 0);
-
   return (
     <div
-      className="fixed z-50 pointer-events-none bg-gray-900 border border-gray-700 rounded-xl p-3 shadow-2xl text-xs"
-      style={{ left: x + 14, top: y - 12 }}
+      className="fixed z-50 pointer-events-none bg-gray-900 border border-gray-700 rounded-lg p-3 shadow-xl text-xs"
+      style={{ left: x + 12, top: y - 10 }}
     >
-      <div className="font-semibold text-white mb-0.5">{province.name}</div>
-      <div className="text-gray-400 mb-2 text-[10px]">{country?.name}</div>
+      <div className="font-semibold text-white mb-1">{province.name}</div>
+      <div className="text-gray-400 mb-2">{country?.name}</div>
       <div className="space-y-1 text-gray-300">
         <div>Type: <span className="capitalize text-white">{province.type}</span></div>
         <div>
-          Resource: <span className={`capitalize ${resourceColors[province.resource_type] ?? ''}`}>{province.resource_type}</span>
+          Resource:{' '}
+          <span className={`capitalize ${resourceColors[province.resource_type] ?? ''}`}>
+            {province.resource_type}
+          </span>
         </div>
         <div>Production: <span className="text-white">{province.base_production}/tick</span></div>
-        <div>Points: <span className="text-amber-400 font-semibold">{province.points}</span></div>
+        <div>Points: <span className="text-amber-400">{province.points}</span></div>
         <div>Morale: <span className="text-white">{province.morale}%</span></div>
-        {totalUnits > 0 && (
-          <div className="border-t border-gray-700 pt-1 mt-1">
-            <span className="text-green-400 font-semibold">{totalUnits} units stationed</span>
-          </div>
-        )}
       </div>
     </div>
   );

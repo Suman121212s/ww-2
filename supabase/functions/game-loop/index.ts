@@ -347,7 +347,61 @@ async function processResourceTransfers(sb: ReturnType<typeof makeSupabase>, tic
 }
 
 // ============================================================
-// 5. MORALE UPDATE
+// 5. TRADE ROUTES PROCESSING
+// ============================================================
+async function processTradeRoutes(sb: ReturnType<typeof makeSupabase>, tick: number) {
+  const { data: routes } = await sb
+    .from("trade_routes")
+    .select("id, from_country_id, to_country_id, route_type, status, distance_km, travel_days, goods_capacity, goods_in_transit, toll_rate")
+    .eq("status", "active");
+
+  if (!routes || routes.length === 0) return;
+
+  const now = new Date();
+
+  for (const route of routes) {
+    // Simple logistics: generate goods flow if route exists
+    // Route processes goods every tick based on travel time
+    const ticksPerDay = 86400 / 60; // seconds per day / tick interval
+    const goodsFlowPerTick = (route.goods_capacity / (route.travel_days * ticksPerDay)) || 0;
+
+    if (goodsFlowPerTick > 0) {
+      const newGoodsInTransit = Math.min(
+        route.goods_capacity,
+        route.goods_in_transit + goodsFlowPerTick
+      );
+
+      await sb
+        .from("trade_routes")
+        .update({
+          goods_in_transit: newGoodsInTransit,
+          updated_at: now.toISOString(),
+        })
+        .eq("id", route.id);
+
+      // Toll revenue: take a cut and add to from_country capital
+      const toll = goodsFlowPerTick * route.toll_rate;
+      if (toll > 0) {
+        const { data: fromCapital } = await sb
+          .from("provinces")
+          .select("id")
+          .eq("type", "capital")
+          .eq("country_id", route.from_country_id)
+          .maybeSingle();
+
+        if (fromCapital) {
+          await sb
+            .from("provinces")
+            .update({ treasury: toll })
+            .eq("id", fromCapital.id);
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// 6. MORALE UPDATE
 // ============================================================
 async function updateMorale(sb: ReturnType<typeof makeSupabase>, tick: number) {
   const { data: provinces } = await sb

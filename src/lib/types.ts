@@ -5,6 +5,8 @@ export type ArmyStatus = 'idle' | 'moving' | 'attacking';
 export type TransactionType = 'production' | 'transfer' | 'consumption';
 export type TransferStatus = 'pending' | 'in_transit' | 'arrived' | 'consumed';
 export type BattleOutcome = 'ongoing' | 'attacker_won' | 'defender_won' | 'draw';
+export type RouteType = 'air' | 'road' | 'maritime';
+export type RouteStatus = 'active' | 'inactive' | 'blocked' | 'damaged';
 export type UnitType = 'infantry' | 'militia' | 'motorized_infantry' | 'mechanized_infantry' | 'commandos' | 'paratroopers' | 'marines' | 'snipers' | 'armored_car' | 'light_tank' | 'medium_tank' | 'heavy_tank' | 'tank_destroyer' | 'interceptor' | 'tactical_bomber' | 'strategic_bomber' | 'naval_bomber' | 'attack_bomber' | 'destroyer' | 'submarine' | 'battleship' | 'carrier' | 'nuclear_bomber' | 'missile_1' | 'nuclear_missile' | 'rocket_artillery' | 'artillery' | 'anti_tank' | 'anti_air';
 
 export interface Country {
@@ -142,6 +144,40 @@ export interface GeneratedCountry {
   flag_color: string;
   capital_slug: string;
   provinces: GeneratedProvince[];
+}
+
+export interface TradeRoute {
+  id: string;
+  from_country_id: string;
+  to_country_id: string;
+  route_type: RouteType;
+  status: RouteStatus;
+  distance_km: number;
+  travel_days: number;
+  goods_capacity: number;
+  goods_in_transit: number;
+  toll_rate: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RoutePath {
+  id: string;
+  trade_route_id: string;
+  route_type: RouteType;
+  coordinates: [number, number][]; // GeoJSON LineString coordinates
+  length_km: number;
+  created_at: string;
+}
+
+export interface ProvinceAdjacency {
+  id: string;
+  province_id: string;
+  adjacent_province_ids: string[];
+  adjacent_countries: string[];
+  boundary_distance_km: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface UnitTemplate {
